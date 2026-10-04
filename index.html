@@ -1,0 +1,128 @@
+
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#10131d">
+  <title>TA Motion Beat Marker</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <div class="brand-mark">TA</div>
+      <div>
+        <p class="eyebrow">TA MOTION SCRIPT</p>
+        <h1>Beat Marker</h1>
+      </div>
+      <span class="local-tag">Xử lý trên thiết bị</span>
+    </header>
+
+    <section class="panel intro">
+      <h2>Tạo bookmark nhịp nhạc cho Alight Motion</h2>
+      <p>Tải MP3 lên, phân tích nhịp và xuất XML. Âm thanh không được tải lên máy chủ.</p>
+    </section>
+
+    <section class="panel">
+      <label class="file-drop" for="audioFile">
+        <span class="upload-icon">♫</span>
+        <strong>Chọn file âm thanh</strong>
+        <span>Hỗ trợ MP3, WAV, M4A và định dạng trình duyệt đọc được</span>
+        <input id="audioFile" type="file" accept="audio/*">
+      </label>
+
+      <div id="fileInfo" class="file-info">Chưa chọn file</div>
+      <audio id="audioPlayer" controls hidden></audio>
+    </section>
+
+    <section class="panel settings">
+      <h3>Thiết lập dự án</h3>
+
+      <div class="grid">
+        <label>Chiều rộng
+          <select id="width">
+            <option>1920</option>
+            <option>1080</option>
+            <option>1280</option>
+            <option>720</option>
+          </select>
+        </label>
+
+        <label>Chiều cao
+          <select id="height">
+            <option>1080</option>
+            <option>1920</option>
+            <option>720</option>
+            <option>1280</option>
+          </select>
+        </label>
+
+        <label>FPS
+          <select id="fps">
+            <option>60</option>
+            <option>30</option>
+            <option>24</option>
+            <option>25</option>
+          </select>
+        </label>
+
+        <label>Độ nhạy phát hiện
+          <select id="sensitivity">
+            <option value="low">Ít marker</option>
+            <option value="medium" selected>Cân bằng</option>
+            <option value="high">Nhiều marker</option>
+          </select>
+        </label>
+      </div>
+
+      <button id="analyzeBtn" class="primary" disabled>
+        Phân tích nhịp
+      </button>
+
+      <p id="status" class="status" aria-live="polite">
+        Hãy chọn file âm thanh để bắt đầu.
+      </p>
+    </section>
+
+    <section class="panel results">
+      <div class="result-head">
+        <h3>Kết quả phân tích</h3>
+        <span id="beatCount" class="count">0 marker</span>
+      </div>
+
+      <div class="stats">
+        <div>
+          <span>Thời lượng</span>
+          <strong id="duration">—</strong>
+        </div>
+        <div>
+          <span>BPM ước tính</span>
+          <strong id="bpm">—</strong>
+        </div>
+        <div>
+          <span>Marker</span>
+          <strong id="markers">0</strong>
+        </div>
+      </div>
+
+      <canvas id="waveform" height="120"></canvas>
+
+      <button id="downloadBtn" class="secondary" disabled>
+        Tải XML cho Alight Motion
+      </button>
+
+      <p class="hint">
+        Cấu trúc bookmark XML được tạo theo mẫu tham khảo.
+        Hãy thử nhập vào Alight Motion và kiểm tra trước khi dùng
+        cho dự án quan trọng.
+      </p>
+    </section>
+
+    <footer>TA Motion Script · Chạy trực tiếp trên trình duyệt</footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+  </html>
+  
