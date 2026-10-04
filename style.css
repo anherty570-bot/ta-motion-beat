@@ -1,0 +1,276 @@
+
+* {
+  box-sizing: border-box;
+}
+
+:root {
+  color-scheme: dark;
+  --bg: #0b0e16;
+  --panel: #151a27;
+  --line: #2b3346;
+  --text: #f4f6ff;
+  --muted: #9aa5bd;
+  --accent: #7c5cff;
+  --cyan: #45d6cf;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(ellipse at 20% 0%, #1c2140 0, transparent 42%),
+    var(--bg);
+  color: var(--text);
+  font: 15px/1.5 Inter, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.app {
+  width: min(760px, 100% - 28px);
+  margin: 34px auto 24px;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 22px;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 52px;
+  height: 52px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, var(--accent), #3f9dff);
+  font-weight: 900;
+  font-size: 20px;
+}
+
+.eyebrow {
+  font-size: 10px;
+  letter-spacing: 2px;
+  color: var(--cyan);
+  margin: 0;
+}
+
+.top h1 {
+  font-size: 25px;
+  margin: 0;
+}
+
+.local-tag {
+  margin-left: auto;
+  border: 1px solid #28544f;
+  color: #9af0dd;
+  border-radius: 30px;
+  padding: 6px 10px;
+  font-size: 11px;
+}
+
+.panel {
+  background: linear-gradient(145deg, #191f2e, #121723);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 20px;
+  margin: 14px 0;
+  box-shadow: 0 14px 35px #0002;
+}
+
+.intro h2 {
+  font-size: 18px;
+  margin: 0 0 7px;
+}
+
+.intro p,
+.hint {
+  color: var(--muted);
+  margin: 0;
+  font-size: 13px;
+}
+
+.file-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 7px;
+  padding: 28px 14px;
+  border: 1px dashed #58617b;
+  border-radius: 14px;
+  background: #0f1420;
+  cursor: pointer;
+}
+
+.file-drop:hover {
+  border-color: var(--cyan);
+}
+
+.upload-icon {
+  font-size: 32px;
+  color: var(--cyan);
+}
+
+.file-drop span:last-of-type {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+input[type="file"] {
+  display: none;
+}
+
+.file-info {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 12px 2px 0;
+  overflow-wrap: anywhere;
+}
+
+audio {
+  width: 100%;
+  margin-top: 12px;
+}
+
+h3 {
+  font-size: 15px;
+  margin: 0 0 15px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.grid label {
+  font-size: 12px;
+  color: var(--muted);
+  display: grid;
+  gap: 6px;
+}
+
+select {
+  background: #0e1320;
+  border: 1px solid #343d52;
+  border-radius: 10px;
+  padding: 11px;
+  color: var(--text);
+  font: inherit;
+  min-width: 0;
+}
+
+button {
+  width: 100%;
+  border: 0;
+  border-radius: 11px;
+  padding: 13px 16px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+  margin-top: 16px;
+}
+
+.primary {
+  background: linear-gradient(90deg, #7657ff, #4c8bff);
+  color: white;
+}
+
+.secondary {
+  background: #183a3a;
+  border: 1px solid #2b6d68;
+  color: #a4fff0;
+}
+
+.primary:disabled,
+.secondary:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.status {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 11px 0 0;
+}
+
+.result-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.count {
+  font-size: 12px;
+  color: var(--cyan);
+}
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.stats div {
+  background: #0e1320;
+  border: 1px solid #252d3e;
+  border-radius: 12px;
+  padding: 12px;
+}
+
+.stats span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.stats strong {
+  display: block;
+  font-size: 19px;
+  margin-top: 4px;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 120px;
+  background: #0d1220;
+  border: 1px solid #252d3e;
+  border-radius: 10px;
+}
+
+.hint {
+  margin-top: 12px;
+  font-size: 11px;
+}
+
+footer {
+  text-align: center;
+  color: #66718a;
+  font-size: 11px;
+  padding: 18px;
+}
+
+@media (max-width: 480px) {
+  .app {
+    margin-top: 18px;
+  }
+
+  .panel {
+    padding: 16px;
+  }
+
+  .local-tag {
+    font-size: 9px;
+  }
+
+  .grid {
+    gap: 9px;
+  }
+
+  .stats strong {
+    font-size: 16px;
+  }
+  }
+  
