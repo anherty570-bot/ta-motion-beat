@@ -1,28 +1,20 @@
 "use strict";
 
 /* =====================================================
-   TA MOTION · BEAT MARKER  (v2 – tách trống rồi mới dò beat)
+   TA MOTION · BEAT MARKER  (v3 – dò beat từ HÌNH ẢNH của video MP4)
 
-   Quy trình:
-   1. Hạ mẫu về ~22 kHz, STFT.
-   2. TÁCH ÂM (HPSS – Harmonic/Percussive Source Separation):
-      lọc median theo thời gian  → phần "nhạc" (giữ nốt, hợp âm, bass kéo dài)
-      lọc median theo tần số     → phần "trống" (cú đập, transient)
-      rồi dùng mặt nạ mềm để chỉ giữ phần trống.
-   3. Spectral flux 3 dải (kick / snare / hi-hat) trên phần trống.
-   4. Tempo (autocorrelation) + dò beat bằng quy hoạch động.
-   5. CHẤM ĐIỂM QUAN TRỌNG cho từng cú đập:
-        - độ mạnh so với toàn bài
-        - loại trống (kick / snare / tom / hi-hat)
-        - vị trí trên lưới nhịp (đúng beat, nửa beat, lệch)
-        - tính lặp lại theo ô nhịp (mẫu trống cố định lặp mỗi bar)
-        - downbeat (phách 1 của ô nhịp)
-      Độ nhạy chỉ là ngưỡng lọc theo điểm này, đổi độ nhạy không cần
-      phân tích lại.
+   Thay vì phân tích âm thanh, app đọc từng khung hình của video
+   (thu nhỏ ~96 px) rồi đo 4 "kênh" thị giác:
+     cut    : chuyển cảnh (histogram + sai khác ảnh sau khi bù rung)
+     shake  : rung / giật camera (đổi hướng chuyển động toàn khung)
+     flash  : chớp sáng / tối đột ngột
+     motion : chuyển động mạnh khác (zoom, xoay, vật thể)
+   Các kênh được gộp thành đường "độ mạnh sự kiện" rồi đi qua cùng
+   pipeline cũ: ước tính tempo → dò beat bằng quy hoạch động →
+   chấm điểm quan trọng. Độ nhạy chỉ là ngưỡng lọc theo điểm này.
 ===================================================== */
 
 const fileInput = document.getElementById("audioFile");
-const audioPlayer = document.getElementById("audioPlayer");
 const analyzeBtn = document.getElementById("analyzeBtn");
 const downloadBtn = document.getElementById("downloadBtn");
 const statusEl = document.getElementById("status");
@@ -31,8 +23,36 @@ const canvas = document.getElementById("waveform");
 const sensitivityEl = document.getElementById("sensitivity");
 const ctx = canvas.getContext("2d");
 
-let audioBuffer = null;
-let selectedName = "audio";
+fileInput.accept = "video/mp4,video/*";
+
+// Dùng thẻ <video>; nếu HTML cũ còn thẻ <audio id="audioPlayer"> thì tự thay.
+const videoPlayer = ensureVideoElement();
+
+function ensureVideoElement() {
+  const existing =
+    document.getElementById("videoPlayer") ||
+    document.getElementById("audioPlayer");
+
+  if (existing && existing.tagName === "VIDEO") return existing;
+
+  const video = document.createElement("video");
+
+  video.id = existing?.id || "videoPlayer";
+  video.className = existing?.className || "";
+  video.controls = true;
+  video.playsInline = true;
+  video.hidden = true;
+  video.style.cssText =
+    "width:100%;max-height:360px;background:#000;border-radius:8px;";
+
+  if (existing) existing.replaceWith(video);
+  else canvas.insertAdjacentElement("beforebegin", video);
+
+  return video;
+}
+
+let mediaInfo = null; // { duration, width, height }
+let selectedName = "video";
 let analysisData = null;
 let analysisToken = 0;
 let objectUrl = null;
@@ -44,42 +64,49 @@ let markerSeconds = [];
 
 /* ---------- cấu hình thuật toán ---------- */
 
-let USE_HPSS = true;
-
-const TARGET_SR = 22050;
-const FFT_SIZE = 1024;
-const HOP = 256;
-
-const HPSS = {
-  timeHalf: 8,     // cửa sổ median theo thời gian: 17 khung (~200 ms)
-  freqHalf: 8,     // cửa sổ median theo tần số: 17 bin
-  lowCutHz: 250    // dưới mức này dùng mặt nạ theo thời gian (giữ kick)
+const VIDEO = {
+  fps: 30,            // số khung lấy mẫu mỗi giây để phân tích
+  minFps: 12,
+  maxFrames: 6000,    // video dài quá sẽ tự hạ fps
+  longSide: 96,       // cạnh dài của ảnh thu nhỏ (px)
+  searchRadius: 6,    // bán kính dò rung toàn khung (px ảnh nhỏ)
+  histBins: 32,
+  seekTimeoutMs: 3000
 };
 
-const BANDS = [
-  { name: "low", lo: 40, hi: 160, weight: 1.4 },
-  { name: "mid", lo: 160, hi: 2500, weight: 1.0 },
-  { name: "high", lo: 2500, hi: 11000, weight: 0.6 }
+// Thang chuẩn hoá: giá trị 1.0 = một sự kiện rõ rệt của kênh đó.
+const SCALE = { cut: 0.4, shake: 1.5, flash: 14, motion: 8 };
+
+const CUT_HARD = 0.35;    // vượt mức này coi là cắt cảnh → bỏ ước lượng rung
+const CHANNEL_CLIP = 3;   // cắt trần để một cú cắt không át hết các cú nhỏ
+
+const CHANNELS = [
+  { name: "cut", weight: 1.5 },
+  { name: "shake", weight: 1.2 },
+  { name: "flash", weight: 0.9 },
+  { name: "motion", weight: 0.6 }
 ];
+
+// Chỉ thêm beat "chỉ có trên lưới nhịp" khi hình ảnh không có gì xảy ra.
+const INCLUDE_GRID_ONLY = false;
 
 /*
   Ngưỡng điểm quan trọng (0 – 1):
-    low    : chỉ cú đập chính (kick/snare trúng nhịp, lặp lại đều)
-    medium : thêm các cú lặp theo mẫu nhưng kém chính hơn
-    high   : thêm hi-hat và cú phụ
+    low    : chỉ sự kiện rất mạnh (cắt cảnh/rung lớn, trúng lưới nhịp)
+    medium : thêm các sự kiện mạnh vừa
+    high   : thêm cả chớp sáng / chuyển động nhỏ
 */
 const IMPORTANCE_THRESHOLD = {
-  low: 0.62,
-  medium: 0.5,
-  high: 0.25
+  low: 0.55,
+  medium: 0.4,
+  high: 0.2
 };
 
 const TYPE_WEIGHT = {
-  kick: 1.0,
-  snare: 0.95,
-  perc: 0.6,
-  tone: 0.2,
-  hat: 0.15,
+  cut: 1.0,
+  shake: 0.85,
+  flash: 0.75,
+  motion: 0.55,
   grid: 0.0
 };
 
@@ -98,7 +125,7 @@ fileInput.addEventListener("change", async () => {
 
   selectedName =
     file.name.replace(/\.[^.]+$/, "")
-      .replace(/[^a-z0-9_-]/gi, "_") || "audio";
+      .replace(/[^a-z0-9_-]/gi, "_") || "video";
 
   fileInfo.textContent =
     `${file.name} · ${(file.size / 1024 / 1024).toFixed(2)} MB`;
@@ -106,8 +133,8 @@ fileInput.addEventListener("change", async () => {
   if (objectUrl) URL.revokeObjectURL(objectUrl);
   objectUrl = URL.createObjectURL(file);
 
-  audioPlayer.src = objectUrl;
-  audioPlayer.hidden = false;
+  videoPlayer.src = objectUrl;
+  videoPlayer.hidden = false;
 
   analyzeBtn.disabled = true;
   downloadBtn.disabled = true;
@@ -115,28 +142,19 @@ fileInput.addEventListener("change", async () => {
   candidates = [];
   visible = [];
   markerSeconds = [];
-  audioBuffer = null;
+  mediaInfo = null;
   analysisData = null;
 
   clearStats();
 
-  statusEl.textContent = "Đang đọc âm thanh…";
+  statusEl.textContent = "Đang đọc video…";
 
   try {
-    const bytes = await file.arrayBuffer();
-
-    const AudioCtx =
-      window.AudioContext || window.webkitAudioContext;
-
-    const audioContext = new AudioCtx();
-
-    const decoded = await audioContext.decodeAudioData(bytes);
-
-    await audioContext.close();
+    const info = await loadVideoMetadata(objectUrl);
 
     if (token !== analysisToken) return;
 
-    audioBuffer = decoded;
+    mediaInfo = info;
 
     analyzeBtn.disabled = false;
 
@@ -144,7 +162,7 @@ fileInput.addEventListener("change", async () => {
       "Đã sẵn sàng. Nhấn Phân tích nhịp.";
 
     document.getElementById("duration").textContent =
-      formatTime(audioBuffer.duration);
+      formatTime(info.duration);
 
     drawWaveform();
 
@@ -154,19 +172,50 @@ fileInput.addEventListener("change", async () => {
     if (token !== analysisToken) return;
 
     statusEl.textContent =
-      "Không đọc được file. Hãy thử MP3 hoặc WAV khác.";
+      "Không đọc được video. Hãy thử file MP4 (H.264) khác.";
   }
 });
+
+function loadVideoMetadata(url) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement("video");
+
+    v.preload = "metadata";
+    v.muted = true;
+    v.playsInline = true;
+
+    v.onloadedmetadata = () => {
+      const info = {
+        duration: v.duration,
+        width: v.videoWidth,
+        height: v.videoHeight
+      };
+
+      v.removeAttribute("src");
+      v.load();
+
+      if (isFinite(info.duration) && info.duration > 0 && info.width) {
+        resolve(info);
+      } else {
+        reject(new Error("Video không có thời lượng/kích thước hợp lệ"));
+      }
+    };
+
+    v.onerror = () => reject(new Error("Trình duyệt không giải mã được video"));
+    v.src = url;
+  });
+}
 
 /* =====================================
    PHÂN TÍCH
 ===================================== */
 
 analyzeBtn.addEventListener("click", async () => {
-  if (!audioBuffer) return;
+  if (!mediaInfo) return;
 
   const token = ++analysisToken;
-  const buffer = audioBuffer;
+  const info = mediaInfo;
+  const url = objectUrl;
 
   analyzeBtn.disabled = true;
   downloadBtn.disabled = true;
@@ -176,16 +225,18 @@ analyzeBtn.addEventListener("click", async () => {
   await nextTick();
 
   try {
-    const result = await analyzeAudio(
-      buffer,
+    const result = await analyzeVideo(
+      url,
+      info,
       (percent, stage) => {
         if (token === analysisToken) {
           statusEl.textContent = `${stage} ${percent}%`;
         }
-      }
+      },
+      () => token !== analysisToken
     );
 
-    if (token !== analysisToken) return;
+    if (token !== analysisToken || !result) return;
 
     analysisData = result;
     candidates = result.candidates;
@@ -201,14 +252,14 @@ analyzeBtn.addEventListener("click", async () => {
     statusEl.textContent = visible.length
       ? `Hoàn tất! ${visible.length} marker (${strong} chính) · ` +
         `độ tin cậy nhịp ${result.reliability}%. ` +
-        "Đổi độ nhạy để lọc ngay, nhấp đúp lên sóng để thêm/xóa."
-      : "Chưa tìm được beat rõ ràng. Hãy thử độ nhạy cao hơn.";
+        "Đổi độ nhạy để lọc ngay, nhấp đúp lên biểu đồ để thêm/xóa."
+      : "Chưa tìm được điểm nhấn rõ ràng. Hãy thử độ nhạy cao hơn.";
 
   } catch (error) {
     console.error(error);
 
     if (token === analysisToken) {
-      statusEl.textContent = "Lỗi trong quá trình phân tích.";
+      statusEl.textContent = "Lỗi trong quá trình phân tích video.";
     }
   }
 
@@ -224,37 +275,31 @@ sensitivityEl.addEventListener("change", () => {
    PIPELINE CHÍNH
 ===================================== */
 
-async function analyzeAudio(buffer, onProgress) {
+async function analyzeVideo(url, info, onProgress, isStale) {
   const report = onProgress || (() => {});
+  const duration = info.duration;
 
-  const { mono, sampleRate } = toMonoDecimated(buffer);
-  const frameDur = HOP / sampleRate;
-  const duration = buffer.duration;
+  let fps = VIDEO.fps;
 
-  const features = await computeFeatures(mono, sampleRate, report);
+  if (duration * fps > VIDEO.maxFrames) {
+    fps = Math.max(VIDEO.minFps, Math.floor(VIDEO.maxFrames / duration));
+  }
+
+  const frameDur = 1 / fps;
+
+  const flux = await extractVideoFeatures(
+    url, info, fps, report, isStale
+  );
+
+  if (!flux) return null;
 
   report(95, "Đang dò nhịp…");
   await nextTick();
 
-  const percussive = buildOnsetEnvelope(features.percussive);
-  const mixed = buildOnsetEnvelope(features.mixed);
-
-  const tempoP = estimateTempo(percussive.env, frameDur);
-  const tempoM = estimateTempo(mixed.env, frameDur);
-
-  // Ưu tiên phần trống; chỉ dùng bản gốc khi bài gần như không có trống.
-  let source = percussive;
-  let tempo = tempoP;
-
-  if (
-    !tempoP ||
-    (tempoM && tempoM.confidence > tempoP.confidence * 1.35)
-  ) {
-    source = mixed;
-    tempo = tempoM;
-  }
-
+  const source = buildOnsetEnvelope(flux, frameDur);
   const env = source.env;
+
+  const tempo = estimateTempo(env, frameDur);
 
   let beats = [];
 
@@ -265,365 +310,298 @@ async function analyzeAudio(buffer, onProgress) {
 
   const onsets = pickOnsets(env, frameDur, 0.3, source.bands);
 
-  const scored = scoreCandidates(
-    onsets,
-    beats,
-    duration,
-    tempo
-  );
+  const scored = scoreCandidates(onsets, beats, duration, tempo);
 
   return {
     candidates: scored.candidates,
     bpm: scored.bpm,
     reliability: scored.reliability,
-    envelope: calculateEnergy(mono, HOP)
-  };
-}
-
-// Hạ mẫu về ~22 kHz và gộp kênh thành mono.
-function toMonoDecimated(buffer) {
-  const channels = buffer.numberOfChannels;
-  const factor = Math.max(1, Math.round(buffer.sampleRate / TARGET_SR));
-  const length = Math.floor(buffer.length / factor);
-
-  const mono = new Float32Array(length);
-
-  for (let c = 0; c < channels; c++) {
-    const data = buffer.getChannelData(c);
-
-    for (let i = 0; i < length; i++) {
-      let sum = 0;
-      const base = i * factor;
-
-      for (let j = 0; j < factor; j++) sum += data[base + j];
-
-      mono[i] += sum;
-    }
-  }
-
-  const norm = 1 / (factor * channels);
-
-  for (let i = 0; i < length; i++) mono[i] *= norm;
-
-  return { mono, sampleRate: buffer.sampleRate / factor };
-}
-
-/* =====================================
-   FFT
-===================================== */
-
-function createFFT(n) {
-  const levels = Math.round(Math.log2(n));
-  const cos = new Float32Array(n / 2);
-  const sin = new Float32Array(n / 2);
-  const rev = new Uint32Array(n);
-
-  for (let i = 0; i < n / 2; i++) {
-    cos[i] = Math.cos((2 * Math.PI * i) / n);
-    sin[i] = Math.sin((2 * Math.PI * i) / n);
-  }
-
-  for (let i = 0; i < n; i++) {
-    let r = 0;
-
-    for (let b = 0; b < levels; b++) {
-      r = (r << 1) | ((i >> b) & 1);
-    }
-
-    rev[i] = r;
-  }
-
-  return function fft(re, im) {
-    for (let i = 0; i < n; i++) {
-      const j = rev[i];
-
-      if (j > i) {
-        let t = re[i]; re[i] = re[j]; re[j] = t;
-        t = im[i]; im[i] = im[j]; im[j] = t;
-      }
-    }
-
-    for (let size = 2; size <= n; size *= 2) {
-      const half = size / 2;
-      const step = n / size;
-
-      for (let i = 0; i < n; i += size) {
-        for (let j = i, k = 0; j < i + half; j++, k += step) {
-          const l = j + half;
-
-          const tre = re[l] * cos[k] + im[l] * sin[k];
-          const tim = -re[l] * sin[k] + im[l] * cos[k];
-
-          re[l] = re[j] - tre;
-          im[l] = im[j] - tim;
-          re[j] += tre;
-          im[j] += tim;
-        }
-      }
-    }
+    envelope: Array.from(env)
   };
 }
 
 /* =====================================
-   MEDIAN TRƯỢT (cho HPSS)
+   ĐỌC KHUNG HÌNH → 4 KÊNH ĐẶC TRƯNG
 ===================================== */
 
-function medianFilter1D(src, dst, n, half, sorted) {
-  const w = half * 2 + 1;
+function waitForEvent(target, name, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Hết thời gian chờ video"));
+    }, timeoutMs);
 
-  for (let j = 0; j < w; j++) {
-    const v = src[Math.min(n - 1, Math.max(0, j - half))];
-    let p = j;
+    const ok = () => { cleanup(); resolve(); };
+    const bad = () => { cleanup(); reject(new Error("Lỗi video")); };
 
-    while (p > 0 && sorted[p - 1] > v) {
-      sorted[p] = sorted[p - 1];
-      p--;
+    function cleanup() {
+      clearTimeout(timer);
+      target.removeEventListener(name, ok);
+      target.removeEventListener("error", bad);
     }
 
-    sorted[p] = v;
-  }
-
-  dst[0] = sorted[half];
-
-  for (let i = 1; i < n; i++) {
-    const out = src[Math.max(0, i - 1 - half)];
-    const inc = src[Math.min(n - 1, i + half)];
-
-    if (out !== inc) {
-      let lo = 0;
-      let hi = w - 1;
-
-      while (lo < hi) {
-        const mid = (lo + hi) >> 1;
-        if (sorted[mid] < out) lo = mid + 1;
-        else hi = mid;
-      }
-
-      let p = lo;
-      sorted[p] = inc;
-
-      while (p > 0 && sorted[p - 1] > inc) {
-        sorted[p] = sorted[p - 1];
-        p--;
-      }
-
-      while (p < w - 1 && sorted[p + 1] < inc) {
-        sorted[p] = sorted[p + 1];
-        p++;
-      }
-
-      sorted[p] = inc;
-    }
-
-    dst[i] = sorted[half];
-  }
-}
-
-/* =====================================
-   STFT → TÁCH TRỐNG/NHẠC → FLUX 3 DẢI
-===================================== */
-
-async function computeFeatures(mono, sampleRate, report) {
-  const N = FFT_SIZE;
-  const half = N / 2;
-  const bins = half + 1;
-  const fft = createFFT(N);
-
-  const win = new Float32Array(N);
-
-  for (let i = 0; i < N; i++) {
-    win[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (N - 1));
-  }
-
-  const nFrames = Math.floor(mono.length / HOP) + 1;
-  const binHz = sampleRate / N;
-  const maxHz = (sampleRate / 2) * 0.98;
-
-  const ranges = BANDS.map(band => {
-    const lo = Math.max(1, Math.floor(band.lo / binHz));
-
-    let hi = Math.min(
-      half - 2,
-      Math.ceil(Math.min(band.hi, maxHz) / binHz)
-    );
-
-    if (hi <= lo) hi = lo + 1;
-
-    return { lo, hi };
+    target.addEventListener(name, ok);
+    target.addEventListener("error", bad);
   });
+}
 
-  /* ---- 1. STFT (biên độ tuyến tính) ---- */
-
-  const mag = new Float32Array(nFrames * bins);
-  const re = new Float32Array(N);
-  const im = new Float32Array(N);
-  const amp = 4 / N;
-
-  for (let f = 0; f < nFrames; f++) {
-    const start = f * HOP - half;
-
-    for (let i = 0; i < N; i++) {
-      const idx = start + i;
-
-      re[i] =
-        idx >= 0 && idx < mono.length
-          ? mono[idx] * win[i]
-          : 0;
-
-      im[i] = 0;
+function seekVideo(video, t) {
+  return new Promise(resolve => {
+    if (Math.abs(video.currentTime - t) < 1e-3 && video.readyState >= 2) {
+      resolve();
+      return;
     }
 
-    fft(re, im);
+    const done = () => {
+      clearTimeout(timer);
+      video.removeEventListener("seeked", done);
+      resolve();
+    };
 
-    const row = f * bins;
+    const timer = setTimeout(done, VIDEO.seekTimeoutMs);
 
-    for (let k = 0; k < bins; k++) {
-      mag[row + k] =
-        Math.sqrt(re[k] * re[k] + im[k] * im[k]) * amp;
-    }
+    video.addEventListener("seeked", done);
+    video.currentTime = t;
+  });
+}
 
-    if (f % 150 === 0) {
-      report(Math.round((f / nFrames) * 35), "Đang đọc phổ âm thanh…");
-      await nextTick();
-    }
-  }
+// Trả về mảng flux[kênh][khung]; null nếu bị huỷ giữa chừng.
+async function extractVideoFeatures(url, info, fps, report, isStale) {
+  const duration = info.duration;
+  const n = Math.max(3, Math.floor(duration * fps));
 
-  /* ---- 2. Thành phần "nhạc": median theo thời gian ---- */
+  const scale = VIDEO.longSide / Math.max(info.width, info.height);
+  const W = Math.max(24, Math.round(info.width * scale));
+  const H = Math.max(24, Math.round(info.height * scale));
 
-  let harm = null;
+  const flux = CHANNELS.map(() => new Float32Array(n));
 
-  if (USE_HPSS) {
-    harm = new Float32Array(nFrames * bins);
+  const video = document.createElement("video");
 
-    const col = new Float32Array(nFrames);
-    const colOut = new Float32Array(nFrames);
-    const sortedT = new Float32Array(HPSS.timeHalf * 2 + 1);
+  video.muted = true;
+  video.playsInline = true;
+  video.preload = "auto";
+  video.src = url;
 
-    for (let k = 0; k < bins; k++) {
-      for (let f = 0; f < nFrames; f++) col[f] = mag[f * bins + k];
+  try {
+    if (video.readyState < 2) await waitForEvent(video, "loadeddata");
 
-      medianFilter1D(col, colOut, nFrames, HPSS.timeHalf, sortedT);
+    const cv = document.createElement("canvas");
+    cv.width = W;
+    cv.height = H;
 
-      for (let f = 0; f < nFrames; f++) harm[f * bins + k] = colOut[f];
+    const c2 = cv.getContext("2d", { willReadFrequently: true });
 
-      if (k % 24 === 0) {
-        report(35 + Math.round((k / bins) * 30), "Đang tách nhạc khỏi trống…");
+    const bins = VIDEO.histBins;
+
+    let prev = new Uint8Array(W * H);
+    let cur = new Uint8Array(W * H);
+    let prevHist = new Float32Array(bins);
+    let curHist = new Float32Array(bins);
+
+    let prevMean = 0;
+    let prevDx = 0;
+    let prevDy = 0;
+
+    const lastTime = Math.max(0, duration - 0.001);
+
+    for (let i = 0; i < n; i++) {
+      if (isStale()) return null;
+
+      // Lấy mẫu giữa khoảng khung để chắc chắn rơi vào đúng khung hình.
+      await seekVideo(video, Math.min(lastTime, (i + 0.5) / fps));
+
+      c2.drawImage(video, 0, 0, W, H);
+
+      const rgba = c2.getImageData(0, 0, W, H).data;
+      const mean = grabLuma(rgba, cur, curHist);
+
+      if (i > 0) {
+        const f = frameFeatures(
+          prev, cur, prevHist, curHist, W, H, prevDx, prevDy
+        );
+
+        flux[0][i] = f.cut / SCALE.cut;
+        flux[1][i] = f.shake / SCALE.shake;
+        flux[2][i] = Math.abs(mean - prevMean) / SCALE.flash;
+        flux[3][i] = f.motion / SCALE.motion;
+
+        prevDx = f.dx;
+        prevDy = f.dy;
+      }
+
+      prevMean = mean;
+
+      let t = prev; prev = cur; cur = t;
+      t = prevHist; prevHist = curHist; curHist = t;
+
+      if (i % 8 === 0) {
+        report(
+          Math.round((i / n) * 92),
+          "Đang phân tích hình ảnh…"
+        );
+
         await nextTick();
       }
     }
-  }
 
-  /* ---- 3. Thành phần "trống": median theo tần số + mặt nạ,
-          rồi flux theo dải cho cả hai bản (trống / gốc) ---- */
+    return flux;
 
-  const fluxP = BANDS.map(() => new Float32Array(nFrames));
-  const fluxM = BANDS.map(() => new Float32Array(nFrames));
-
-  const rowPerc = new Float32Array(bins);
-  const sortedF = new Float32Array(HPSS.freqHalf * 2 + 1);
-  const crossover = Math.max(2, Math.ceil(HPSS.lowCutHz / binHz));
-
-  let prevP = new Float32Array(bins);
-  let curP = new Float32Array(bins);
-  let prevM = new Float32Array(bins);
-  let curM = new Float32Array(bins);
-
-  const scale = 1000;
-
-  for (let f = 0; f < nFrames; f++) {
-    const row = mag.subarray(f * bins, (f + 1) * bins);
-
-    if (USE_HPSS) {
-      medianFilter1D(row, rowPerc, bins, HPSS.freqHalf, sortedF);
-
-      const base = f * bins;
-
-      for (let k = 0; k < bins; k++) {
-        // Dải trầm: kick hẹp theo tần số nên dùng chính biên độ làm "P".
-        const p = k < crossover ? row[k] : rowPerc[k];
-        const h = harm[base + k];
-
-        const p2 = p * p;
-        const mask = p2 / (p2 + h * h + 1e-12);
-
-        curP[k] = Math.log1p(row[k] * mask * scale);
-        curM[k] = Math.log1p(row[k] * scale);
-      }
-    } else {
-      for (let k = 0; k < bins; k++) {
-        curP[k] = curM[k] = Math.log1p(row[k] * scale);
-      }
-    }
-
-    if (f > 0) {
-      accumulateFlux(curP, prevP, ranges, fluxP, f);
-      accumulateFlux(curM, prevM, ranges, fluxM, f);
-    }
-
-    let tmp = prevP; prevP = curP; curP = tmp;
-    tmp = prevM; prevM = curM; curM = tmp;
-
-    if (f % 200 === 0) {
-      report(65 + Math.round((f / nFrames) * 30), "Đang tách nhạc khỏi trống…");
-      await nextTick();
-    }
-  }
-
-  return { percussive: fluxP, mixed: fluxM };
-}
-
-// Spectral flux nửa sóng, max-filter khung trước (±1 bin) để bỏ vibrato.
-function accumulateFlux(cur, prev, ranges, out, f) {
-  for (let b = 0; b < ranges.length; b++) {
-    const { lo, hi } = ranges[b];
-    let sum = 0;
-
-    for (let k = lo; k <= hi; k++) {
-      const pm = Math.max(prev[k - 1], prev[k], prev[k + 1]);
-      const d = cur[k] - pm;
-
-      if (d > 0) sum += d;
-    }
-
-    out[b][f] = sum / (hi - lo + 1);
+  } finally {
+    video.removeAttribute("src");
+    video.load();
   }
 }
+
+// RGBA → độ sáng (0–255) + histogram chuẩn hoá; trả về độ sáng trung bình.
+function grabLuma(rgba, luma, hist) {
+  const shift = 8 - Math.log2(hist.length);
+
+  hist.fill(0);
+
+  let sum = 0;
+
+  for (let p = 0, i = 0; p < luma.length; p++, i += 4) {
+    const y = (rgba[i] * 77 + rgba[i + 1] * 150 + rgba[i + 2] * 29) >> 8;
+
+    luma[p] = y;
+    sum += y;
+    hist[y >> shift]++;
+  }
+
+  const inv = 1 / luma.length;
+
+  for (let b = 0; b < hist.length; b++) hist[b] *= inv;
+
+  return sum * inv;
+}
+
+function frameFeatures(prev, cur, prevHist, curHist, W, H, prevDx, prevDy) {
+  let histDist = 0;
+
+  for (let b = 0; b < curHist.length; b++) {
+    histDist += Math.abs(curHist[b] - prevHist[b]);
+  }
+
+  histDist *= 0.5;
+
+  const m = estimateGlobalMotion(prev, cur, W, H, VIDEO.searchRadius);
+
+  // Sai khác còn lại sau khi đã bù rung toàn khung.
+  const residual = m.sad;
+  const cut = histDist + residual / 255;
+
+  if (cut >= CUT_HARD) {
+    // Cắt cảnh: ước lượng chuyển động vô nghĩa → không tính rung.
+    return { cut, shake: 0, motion: 0, dx: 0, dy: 0 };
+  }
+
+  const jerk = Math.hypot(m.dx - prevDx, m.dy - prevDy);
+  const mag = Math.hypot(m.dx, m.dy);
+
+  return {
+    cut,
+    shake: 0.7 * jerk + 0.3 * mag,
+    motion: residual,
+    dx: m.dx,
+    dy: m.dy
+  };
+}
+
+// Dò dịch chuyển toàn khung (dx, dy) làm SAD nhỏ nhất, có nội suy dưới điểm ảnh.
+function estimateGlobalMotion(prev, cur, W, H, R) {
+  const x0 = R, x1 = W - R, y0 = R, y1 = H - R;
+  const area = (x1 - x0) * (y1 - y0);
+  const side = 2 * R + 1;
+  const sads = new Float32Array(side * side);
+
+  let bestCost = Infinity;
+  let bestRaw = 0;
+  let bi = 0;
+
+  for (let dy = -R; dy <= R; dy++) {
+    for (let dx = -R; dx <= R; dx++) {
+      let sad = 0;
+
+      for (let y = y0; y < y1; y++) {
+        const rc = y * W;
+        const rp = (y + dy) * W + dx;
+
+        for (let x = x0; x < x1; x++) {
+          const d = cur[rc + x] - prev[rp + x];
+          sad += d < 0 ? -d : d;
+        }
+      }
+
+      const idx = (dy + R) * side + (dx + R);
+
+      sads[idx] = sad;
+
+      // Phạt nhẹ dịch chuyển lớn để khung phẳng/đen không cho kết quả ngẫu nhiên.
+      const cost = sad + (Math.abs(dx) + Math.abs(dy)) * area * 0.02;
+
+      if (cost < bestCost) {
+        bestCost = cost;
+        bestRaw = sad;
+        bi = idx;
+      }
+    }
+  }
+
+  const bx = bi % side;
+  const by = (bi / side) | 0;
+
+  let sx = 0;
+  let sy = 0;
+
+  if (bx > 0 && bx < side - 1) {
+    sx = subPixel(sads[bi - 1], sads[bi], sads[bi + 1]);
+  }
+
+  if (by > 0 && by < side - 1) {
+    sy = subPixel(sads[bi - side], sads[bi], sads[bi + side]);
+  }
+
+  return { dx: bx - R + sx, dy: by - R + sy, sad: bestRaw / area };
+}
+
+function subPixel(a, b, c) {
+  const d = a - 2 * b + c;
+
+  if (Math.abs(d) < 1e-6) return 0;
+
+  return Math.max(-0.5, Math.min(0.5, (0.5 * (a - c)) / d));
+}
+
 
 /* =====================================
    ONSET ENVELOPE
 ===================================== */
 
-function buildOnsetEnvelope(flux) {
+function buildOnsetEnvelope(flux, frameDur) {
   const n = flux[0].length;
   const env = new Float32Array(n);
 
-  const means = flux.map(arr => {
-    let s = 0;
-    for (let i = 0; i < n; i++) s += arr[i];
-    return s / Math.max(1, n);
-  });
-
-  const globalMean =
-    means.reduce((a, b) => a + b, 0) / means.length;
-
-  // Mỗi dải chuẩn hoá theo mức trung bình của chính nó.
-  const bands = flux.map((arr, b) => {
-    const denom = Math.max(means[b], globalMean * 0.1, 1e-9);
+  // Các kênh đã ở thang "1 = sự kiện rõ"; chỉ cắt trần để một cú cắt cảnh
+  // khổng lồ không át hết các cú rung nhỏ hơn.
+  const bands = flux.map(arr => {
     const norm = new Float32Array(n);
 
-    for (let i = 0; i < n; i++) norm[i] = arr[i] / denom;
+    for (let i = 0; i < n; i++) {
+      norm[i] = Math.min(CHANNEL_CLIP, arr[i]);
+    }
 
     return norm;
   });
 
-  for (let b = 0; b < BANDS.length; b++) {
-    const w = BANDS[b].weight;
+  for (let c = 0; c < CHANNELS.length; c++) {
+    const w = CHANNELS[c].weight;
 
-    for (let i = 0; i < n; i++) env[i] += bands[b][i] * w;
+    for (let i = 0; i < n; i++) env[i] += bands[c][i] * w;
   }
 
   // Trừ xu hướng nền (trung bình trượt ~0.6 s), giữ phần dương.
-  const radius = Math.max(2, Math.round(0.3 / (HOP / TARGET_SR)));
+  const radius = Math.max(2, Math.round(0.3 / frameDur));
   const prefix = new Float64Array(n + 1);
 
   for (let i = 0; i < n; i++) prefix[i + 1] = prefix[i] + env[i];
@@ -915,49 +893,45 @@ function pickOnsets(env, frameDur, k, bands) {
 
     if (!isPeak) continue;
 
-    // Năng lượng từng dải quanh đỉnh → dùng để nhận diện loại trống.
-    let l = 0;
-    let m = 0;
-    let h = 0;
+    // Cường độ từng kênh quanh đỉnh → xác định loại sự kiện.
+    const ch = [];
 
-    for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) {
-      l = Math.max(l, bands[0][j]);
-      m = Math.max(m, bands[1][j]);
-      h = Math.max(h, bands[2][j]);
+    for (let c = 0; c < bands.length; c++) {
+      let mx = 0;
+
+      for (let j = Math.max(0, i - 1); j <= Math.min(n - 1, i + 1); j++) {
+        mx = Math.max(mx, bands[c][j]);
+      }
+
+      ch.push(mx);
     }
 
     onsets.push({
       time: parabolic(env, i) * frameDur,
       strength: v,
-      low: l,
-      mid: m,
-      high: h,
-      type: "perc"
+      channels: ch,
+      type: classifyOnset(ch)
     });
   }
-
-  for (const o of onsets) o.type = classifyOnset(o.low, o.mid, o.high);
 
   return onsets;
 }
 
-function classifyOnset(l, m, h) {
-  // Dùng tỉ lệ giữa các dải (không phụ thuộc âm lượng bài):
-  //   kick  : trầm áp đảo (kể cả khi trùng hi-hat)
-  //   hat   : cao áp đảo
-  //   tone  : chỉ có dải giữa, gần như không có dải cao (nốt giai điệu rò)
-  //   snare : nhiễu dải rộng, dải giữa + dải cao
-  const eps = 1e-9;
-  const lowRatio = l / (m + h + eps);
-  const highRatio = h / (l + m + eps);
-  const midOverHigh = m / (h + eps);
+// Loại sự kiện = kênh có đóng góp (đã nhân trọng số) lớn nhất.
+function classifyOnset(ch) {
+  let best = 0;
+  let bestVal = -Infinity;
 
-  if (lowRatio >= 0.6) return "kick";
-  if (highRatio >= 1.2) return "hat";
-  if (midOverHigh >= 8 && lowRatio < 0.3) return "tone";
-  if (highRatio >= 0.35) return "snare";
+  for (let c = 0; c < ch.length; c++) {
+    const val = ch[c] * CHANNELS[c].weight;
 
-  return "perc";
+    if (val > bestVal) {
+      bestVal = val;
+      best = c;
+    }
+  }
+
+  return CHANNELS[best].name;
 }
 
 /* =====================================
@@ -982,7 +956,7 @@ function scoreCandidates(onsets, beats, duration, tempo) {
     for (const o of onsets) {
       const S = Math.min(1, o.strength / (1.2 * p90));
       const T = TYPE_WEIGHT[o.type];
-      const base = 0.35 * S + 0.25 * 0.4 + 0.25 * 0.4;
+      const base = 0.75 * S + 0.1;
 
       result.push(makeCandidate(o.time, Math.min(1, base * (0.45 + 0.55 * T)), o.type));
     }
@@ -1033,7 +1007,7 @@ function scoreCandidates(onsets, beats, duration, tempo) {
   const unsupportedBeats = [];
 
   for (const t of beats) {
-    if (nearestOnset(t, 0.06) >= 0) supported++;
+    if (nearestOnset(t, 0.08) >= 0) supported++;
     else unsupportedBeats.push(t);
   }
 
@@ -1044,20 +1018,20 @@ function scoreCandidates(onsets, beats, duration, tempo) {
   // ---- Lưới nhịp mở rộng ra hai đầu bài ----
   const { grid } = extendGrid(beats, duration);
 
-  // ---- Downbeat (phách 1) – ước lượng bằng kick/snare ----
-  const kickSum = [0, 0, 0, 0];
-  const snareSum = [0, 0, 0, 0];
+  // ---- Downbeat (phách 1) – cắt cảnh/rung thường rơi vào phách đầu ô nhịp ----
+  const cutSum = [0, 0, 0, 0];
+  const shakeSum = [0, 0, 0, 0];
   const phaseCount = [0, 0, 0, 0];
 
   for (let i = 0; i < grid.length; i++) {
-    const j = nearestOnset(grid[i], 0.06);
+    const j = nearestOnset(grid[i], 0.08);
     const ph = i % 4;
 
     phaseCount[ph]++;
 
     if (j >= 0) {
-      kickSum[ph] += onsets[j].low;
-      snareSum[ph] += onsets[j].mid;
+      cutSum[ph] += onsets[j].channels[0];
+      shakeSum[ph] += onsets[j].channels[1];
     }
   }
 
@@ -1067,10 +1041,7 @@ function scoreCandidates(onsets, beats, duration, tempo) {
   let downBest = -Infinity;
 
   for (let p = 0; p < 4; p++) {
-    const score =
-      avg(kickSum, p) +
-      0.5 * (avg(snareSum, (p + 1) % 4) + avg(snareSum, (p + 3) % 4)) -
-      0.5 * (avg(snareSum, p) + avg(snareSum, (p + 2) % 4));
+    const score = avg(cutSum, p) + 0.5 * avg(shakeSum, p);
 
     if (score > downBest) {
       downBest = score;
@@ -1079,8 +1050,8 @@ function scoreCandidates(onsets, beats, duration, tempo) {
   }
 
   // ---- Vị trí từng onset trên ô nhịp (16 khe / bar) ----
-  const classIndex = { kick: 0, snare: 1, hat: 2, perc: 3, tone: 4 };
-  const occupancy = [0, 1, 2, 3, 4].map(() => new Float32Array(16));
+  const classIndex = { cut: 0, shake: 1, flash: 2, motion: 3 };
+  const occupancy = [0, 1, 2, 3].map(() => new Float32Array(16));
 
   for (const o of onsets) {
     const j = lowerBound(grid, o.time) - 1;
@@ -1129,17 +1100,19 @@ function scoreCandidates(onsets, beats, duration, tempo) {
       else if (o.slot % 4 === 0) bonus = 0.05;
     }
 
-    const base = 0.35 * S + 0.25 * G + 0.25 * R + bonus;
+    const base = 0.6 * S + 0.2 * G + 0.1 * R + bonus;
     const importance = Math.min(1, base * (0.45 + 0.55 * T));
 
     result.push(makeCandidate(o.time, importance, o.type));
   }
 
-  // Beat của lưới mà không có cú đập thật: vẫn giữ nếu lưới đáng tin.
-  const gridImportance = support >= 0.5 ? 0.52 : 0.2;
+  // Beat của lưới mà hình ảnh không có gì xảy ra: mặc định bỏ qua.
+  if (INCLUDE_GRID_ONLY) {
+    const gridImportance = support >= 0.5 ? 0.52 : 0.2;
 
-  for (const t of unsupportedBeats) {
-    result.push(makeCandidate(t, gridImportance, "grid"));
+    for (const t of unsupportedBeats) {
+      result.push(makeCandidate(t, gridImportance, "grid"));
+    }
   }
 
   return {
@@ -1205,30 +1178,6 @@ function extendGrid(beats, duration) {
   grid.push(grid[grid.length - 1] + back);
 
   return { grid, offset };
-}
-
-/* =====================================
-   NĂNG LƯỢNG RMS (DÙNG ĐỂ VẼ)
-===================================== */
-
-function calculateEnergy(signal, hop) {
-  const result = [];
-
-  for (let start = 0; start < signal.length; start += hop) {
-    let sum = 0;
-
-    const end = Math.min(start + hop, signal.length);
-
-    for (let i = start; i < end; i++) {
-      sum += signal[i] * signal[i];
-    }
-
-    result.push(
-      Math.sqrt(sum / Math.max(1, end - start))
-    );
-  }
-
-  return result;
 }
 
 /* =====================================
@@ -1307,10 +1256,10 @@ function applyVisible() {
 
 // Nhấp đúp lên sóng âm: xóa marker gần nhất hoặc thêm marker mới.
 canvas.addEventListener("dblclick", event => {
-  if (!audioBuffer) return;
+  if (!mediaInfo) return;
 
   const rect = canvas.getBoundingClientRect();
-  const duration = audioBuffer.duration;
+  const duration = mediaInfo.duration;
   const time = ((event.clientX - rect.left) / rect.width) * duration;
   const tolerance = (8 / rect.width) * duration;
 
@@ -1347,17 +1296,17 @@ canvas.addEventListener("dblclick", event => {
 });
 
 canvas.addEventListener("click", event => {
-  if (!audioBuffer) return;
+  if (!mediaInfo) return;
 
   const rect = canvas.getBoundingClientRect();
   const ratio = (event.clientX - rect.left) / rect.width;
 
-  audioPlayer.currentTime =
-    Math.max(0, Math.min(1, ratio)) * audioBuffer.duration;
+  videoPlayer.currentTime =
+    Math.max(0, Math.min(1, ratio)) * mediaInfo.duration;
 });
 
 /* =====================================
-   NGHE THỬ MARKER BẰNG TIẾNG CLICK
+   NGHE THỬ MARKER BẰNG TIẾNG CLICK (phát cùng video)
 ===================================== */
 
 let clickToggle = document.getElementById("clickPreview");
@@ -1415,13 +1364,13 @@ function playClick(strong, delay) {
 }
 
 function resetClickCursor() {
-  clickIndex = lowerBound(markerSeconds, audioPlayer.currentTime);
+  clickIndex = lowerBound(markerSeconds, videoPlayer.currentTime);
 }
 
 function previewLoop() {
-  const now = audioPlayer.currentTime;
+  const now = videoPlayer.currentTime;
 
-  if (clickToggle.checked && !audioPlayer.paused && clickContext) {
+  if (clickToggle.checked && !videoPlayer.paused && clickContext) {
     const lookahead = 0.05;
 
     while (
@@ -1440,12 +1389,12 @@ function previewLoop() {
 
   drawWaveform();
 
-  if (!audioPlayer.paused) {
+  if (!videoPlayer.paused) {
     rafId = requestAnimationFrame(previewLoop);
   }
 }
 
-audioPlayer.addEventListener("play", () => {
+videoPlayer.addEventListener("play", () => {
   if (clickToggle.checked) ensureClickContext();
 
   resetClickCursor();
@@ -1453,17 +1402,17 @@ audioPlayer.addEventListener("play", () => {
   rafId = requestAnimationFrame(previewLoop);
 });
 
-audioPlayer.addEventListener("pause", () => {
+videoPlayer.addEventListener("pause", () => {
   cancelAnimationFrame(rafId);
   drawWaveform();
 });
 
-audioPlayer.addEventListener("ended", () => {
+videoPlayer.addEventListener("ended", () => {
   cancelAnimationFrame(rafId);
   drawWaveform();
 });
 
-audioPlayer.addEventListener("seeked", () => {
+videoPlayer.addEventListener("seeked", () => {
   resetClickCursor();
   drawWaveform();
 });
@@ -1576,7 +1525,7 @@ function drawWaveform() {
   const width = Math.max(300, canvas.clientWidth);
   const height = 120;
 
-  const duration = audioBuffer?.duration || 1;
+  const duration = mediaInfo?.duration || 1;
 
   canvas.width = Math.floor(width * dpr);
   canvas.height = Math.floor(height * dpr);
@@ -1657,8 +1606,8 @@ function drawWaveform() {
     ctx.stroke();
   }
 
-  if (audioBuffer && audioPlayer.currentTime > 0) {
-    const x = (audioPlayer.currentTime / duration) * width;
+  if (mediaInfo && videoPlayer.currentTime > 0) {
+    const x = (videoPlayer.currentTime / duration) * width;
 
     ctx.strokeStyle = "#ffffff";
     ctx.lineWidth = 1;
@@ -1701,5 +1650,5 @@ function escapeXml(value) {
 }
 
 window.addEventListener("resize", () => {
-  if (audioBuffer) drawWaveform();
+  if (mediaInfo) drawWaveform();
 });
